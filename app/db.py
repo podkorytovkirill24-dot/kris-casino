@@ -159,15 +159,47 @@ class Database:
             await db.commit()
             return int(cursor.lastrowid)
 
-    async def list_pending_deposits(self, limit: int = 10) -> list[dict[str, Any]]:
+    async def list_pending_deposits(self, limit: int | None = 10) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            query = "SELECT * FROM deposits WHERE status = 'pending' ORDER BY id DESC"
+            params: tuple[Any, ...] = ()
+            if limit is not None:
+                query += " LIMIT ?"
+                params = (limit,)
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def list_deposits_by_date(self, date_str: str) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
             cursor = await db.execute(
-                "SELECT * FROM deposits WHERE status = 'pending' ORDER BY id DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM deposits WHERE date(created_at) = ? ORDER BY id DESC",
+                (date_str,),
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
+
+    async def get_deposits_stats_by_date(self, date_str: str) -> dict[str, float]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS sum, COUNT(*) AS cnt FROM deposits WHERE status = 'paid' AND date(created_at) = ?",
+                (date_str,),
+            )
+            paid = await cursor.fetchone()
+            cursor = await db.execute(
+                "SELECT COALESCE(SUM(amount), 0) AS sum, COUNT(*) AS cnt FROM deposits WHERE status = 'pending' AND date(created_at) = ?",
+                (date_str,),
+            )
+            pending = await cursor.fetchone()
+            return {
+                "paid_sum": float(paid["sum"]) if paid else 0.0,
+                "paid_count": float(paid["cnt"]) if paid else 0.0,
+                "pending_sum": float(pending["sum"]) if pending else 0.0,
+                "pending_count": float(pending["cnt"]) if pending else 0.0,
+            }
 
     async def get_deposit(self, deposit_id: int) -> dict[str, Any] | None:
         async with aiosqlite.connect(self.path) as db:
@@ -323,11 +355,10 @@ class Database:
                 "pending_count": float(pending["cnt"]) if pending else 0.0,
             }
 
-    async def get_users_overview(self, limit: int = 10) -> list[dict[str, Any]]:
+    async def get_users_overview(self, limit: int | None = 10) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute(
-                """
+            query = """
                 SELECT
                     u.id,
                     u.username,
@@ -350,9 +381,49 @@ class Database:
                     GROUP BY user_id
                 ) d ON d.user_id = u.id
                 ORDER BY u.id DESC
-                LIMIT ?
-                """,
-                (limit,),
+            """
+            params: tuple[Any, ...] = ()
+            if limit is not None:
+                query += " LIMIT ?"
+                params = (limit,)
+            cursor = await db.execute(query, params)
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_game_stats(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT
+                    game,
+                    COUNT(*) AS bets_count,
+                    COALESCE(SUM(bet_amount), 0) AS bets_sum,
+                    COALESCE(SUM(payout), 0) AS payouts_sum,
+                    COALESCE(SUM(win), 0) AS wins
+                FROM bets
+                GROUP BY game
+                ORDER BY bets_sum DESC
+                """
+            )
+            rows = await cursor.fetchall()
+            return [dict(row) for row in rows]
+
+    async def get_user_game_stats(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                """
+                SELECT
+                    user_id,
+                    game,
+                    COUNT(*) AS bets_count,
+                    COALESCE(SUM(bet_amount), 0) AS bets_sum,
+                    COALESCE(SUM(payout), 0) AS payouts_sum
+                FROM bets
+                GROUP BY user_id, game
+                ORDER BY user_id DESC
+                """
             )
             rows = await cursor.fetchall()
             return [dict(row) for row in rows]
