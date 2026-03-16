@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram import Router, F
@@ -13,7 +14,7 @@ from app.keyboards import admin_deposit_action, admin_menu, admin_withdraw_actio
 from app.services.access import is_admin
 from app import texts
 from app.utils import format_money, parse_amount
-from app.states import AdminGrantState, AdminFreezeState, AdminSubscribeState
+from app.states import AdminGrantState, AdminFreezeState, AdminSubscribeState, AdminDepositState
 
 router = Router()
 
@@ -31,6 +32,51 @@ def _admin_only_message(message: Message, config: Config) -> bool:
 
 def _owner_only(callback_or_message: CallbackQuery | Message, config: Config) -> bool:
     return callback_or_message.from_user.id in config.owner_ids
+
+
+def _parse_date_input(text: str) -> str | None:
+    raw = text.strip().lower()
+    today = datetime.now(timezone.utc).date()
+    if raw in {"today", "сегодня"}:
+        return today.isoformat()
+    if raw in {"yesterday", "вчера"}:
+        return (today - timedelta(days=1)).isoformat()
+    for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y"):
+        try:
+            return datetime.strptime(text.strip(), fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
+def _deposit_status_label(status: str) -> str:
+    mapping = {
+        "paid": "✅ оплачено",
+        "pending": "⏳ ожидает",
+        "expired": "⌛ истек",
+        "canceled": "❌ отменено",
+        "failed": "❌ ошибка",
+    }
+    return mapping.get(status, status)
+
+
+async def _send_blocks(message: Message, blocks: list[str], header: str | None = None, reply_markup=None) -> None:
+    max_len = 3500
+    parts: list[str] = []
+    current = header or ""
+    for block in blocks:
+        candidate = current + ("\n\n" if current else "") + block
+        if len(candidate) > max_len and current:
+            parts.append(current)
+            current = block
+        else:
+            current = candidate
+    if current:
+        parts.append(current)
+
+    for idx, part in enumerate(parts):
+        markup = reply_markup if idx == len(parts) - 1 else None
+        await message.answer(part, reply_markup=markup)
 
 
 def _extract_invite_link(text: str) -> str | None:
@@ -80,6 +126,54 @@ async def admin_stats(callback: CallbackQuery, state: FSMContext, db: Database, 
         ),
         reply_markup=admin_menu(),
     )
+
+    game_stats = await db.get_game_stats()
+    if game_stats:
+        lines = []
+        for item in game_stats:
+            bets_sum = float(item["bets_sum"])
+            payouts_sum = float(item["payouts_sum"])
+            profit = bets_sum - payouts_sum
+            bets_count = int(item["bets_count"])
+            wins = int(item["wins"])
+            win_rate = (wins / bets_count * 100) if bets_count else 0.0
+            lines.append(
+                f"🎮 {texts.game_title(item['game'])}: "
+                f"ставки {format_money(bets_sum)} {config.currency}, "
+                f"выплаты {format_money(payouts_sum)} {config.currency}, "
+                f"профит {format_money(profit)} {config.currency}, "
+                f"побед {wins}/{bets_count} ({win_rate:.1f}%)"
+            )
+        await _send_blocks(callback.message, lines, header="📊 <b>Игры</b>")
+
+    users = await db.get_users_overview(limit=None)
+    active_users = []
+    for user in users:
+        bets_sum = float(user.get("bets_sum", 0))
+        payouts_sum = float(user.get("payouts_sum", 0))
+        if bets_sum <= 0 and payouts_sum <= 0:
+            continue
+        profit = payouts_sum - bets_sum
+        active_users.append((user, profit))
+
+    if active_users:
+        winners = sorted([item for item in active_users if item[1] >= 0], key=lambda x: x[1], reverse=True)
+        losers = sorted([item for item in active_users if item[1] < 0], key=lambda x: x[1])
+
+        if winners:
+            win_lines = []
+            for user, profit in winners:
+                display = texts.display_user(user.get("username"), user.get("first_name"))
+                sign = "+" if profit >= 0 else ""
+                win_lines.append(f"✅ {display}: {sign}{format_money(profit)} {config.currency}")
+            await _send_blocks(callback.message, win_lines, header="🏆 <b>Профит игроков</b>")
+
+        if losers:
+            lose_lines = []
+            for user, profit in losers:
+                display = texts.display_user(user.get("username"), user.get("first_name"))
+                lose_lines.append(f"❌ {display}: {format_money(profit)} {config.currency}")
+            await _send_blocks(callback.message, lose_lines, header="💸 <b>Слил (убыток)</b>")
     await callback.answer()
 
 
@@ -89,15 +183,26 @@ async def admin_deposits(callback: CallbackQuery, state: FSMContext, db: Databas
         await callback.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    pending = await db.list_pending_deposits(limit=10)
-    if not pending:
-        await callback.message.answer(texts.no_pending_deposits(), reply_markup=admin_menu())
+    today = datetime.now(timezone.utc).date().isoformat()
+    stats = await db.get_deposits_stats_by_date(today)
+    deposits = await db.list_deposits_by_date(today)
+
+    header = (
+        f"💎 <b>Пополнения за {today} (UTC)</b>\n"
+        f"✅ Оплачено: <b>{format_money(stats['paid_sum'])} {config.currency}</b> ({int(stats['paid_count'])})\n"
+        f"⏳ Ожидает: <b>{format_money(stats['pending_sum'])} {config.currency}</b> ({int(stats['pending_count'])})\n"
+        "Чтобы посмотреть другую дату, введи её в формате ДД.ММ.ГГГГ или YYYY-MM-DD."
+    )
+
+    if not deposits:
+        await callback.message.answer(header + "\n\nПополнений за эту дату нет.", reply_markup=admin_menu())
+        await state.set_state(AdminDepositState.waiting_date)
         await callback.answer()
         return
 
     user_cache: dict[int, tuple[str | None, str | None]] = {}
     lines = []
-    for item in pending:
+    for item in deposits:
         user_id = item["user_id"]
         if user_id in user_cache:
             username, first_name = user_cache[user_id]
@@ -106,19 +211,90 @@ async def admin_deposits(callback: CallbackQuery, state: FSMContext, db: Databas
             username = user.get("username") if user else None
             first_name = user.get("first_name") if user else None
             user_cache[user_id] = (username, first_name)
-        lines.append(
-            texts.pending_deposit_line(item["id"], username, first_name, item["amount"], config.currency)
-        )
-    await callback.message.answer("🧾 Ожидают подтверждения:\n" + "\n".join(lines), reply_markup=admin_menu())
-    for item in pending:
-        username, first_name = user_cache.get(item["user_id"], (None, None))
         display = texts.display_user(username, first_name)
-        await callback.message.answer(
-            f"Пополнение #{item['id']} от пользователя {display}\n"
-            f"Сумма: {item['amount']:.2f} {config.currency}",
-            reply_markup=admin_deposit_action(item["id"]),
+        status_label = _deposit_status_label(item["status"])
+        lines.append(
+            f"{status_label} | #{item['id']} | {display} | {format_money(item['amount'])} {config.currency}"
         )
+
+    await _send_blocks(callback.message, lines, header=header, reply_markup=admin_menu())
+
+    pending = await db.list_pending_deposits(limit=None)
+    if pending:
+        pending_lines = []
+        for item in pending:
+            user_id = item["user_id"]
+            if user_id in user_cache:
+                username, first_name = user_cache[user_id]
+            else:
+                user = await db.get_user(user_id)
+                username = user.get("username") if user else None
+                first_name = user.get("first_name") if user else None
+                user_cache[user_id] = (username, first_name)
+            pending_lines.append(
+                texts.pending_deposit_line(item["id"], username, first_name, item["amount"], config.currency)
+            )
+        await callback.message.answer("🧾 Ожидают подтверждения:\n" + "\n".join(pending_lines), reply_markup=admin_menu())
+        for item in pending:
+            username, first_name = user_cache.get(item["user_id"], (None, None))
+            display = texts.display_user(username, first_name)
+            await callback.message.answer(
+                f"Пополнение #{item['id']} от пользователя {display}\n"
+                f"Сумма: {item['amount']:.2f} {config.currency}",
+                reply_markup=admin_deposit_action(item["id"]),
+            )
+
+    await state.set_state(AdminDepositState.waiting_date)
     await callback.answer()
+
+
+@router.message(AdminDepositState.waiting_date)
+async def admin_deposits_date(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    if not _admin_only_message(message, config):
+        return
+    text = (message.text or "").strip()
+    if text.lower() in {"/cancel", "cancel", "отмена"}:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=admin_menu())
+        return
+
+    date_str = _parse_date_input(text)
+    if not date_str:
+        await message.answer("⚠️ Неверный формат даты. Пример: 16.03.2026 или 2026-03-16.", reply_markup=back_to_admin())
+        return
+
+    stats = await db.get_deposits_stats_by_date(date_str)
+    deposits = await db.list_deposits_by_date(date_str)
+    header = (
+        f"💎 <b>Пополнения за {date_str} (UTC)</b>\n"
+        f"✅ Оплачено: <b>{format_money(stats['paid_sum'])} {config.currency}</b> ({int(stats['paid_count'])})\n"
+        f"⏳ Ожидает: <b>{format_money(stats['pending_sum'])} {config.currency}</b> ({int(stats['pending_count'])})"
+    )
+
+    if not deposits:
+        await state.clear()
+        await message.answer(header + "\n\nПополнений за эту дату нет.", reply_markup=admin_menu())
+        return
+
+    user_cache: dict[int, tuple[str | None, str | None]] = {}
+    lines = []
+    for item in deposits:
+        user_id = item["user_id"]
+        if user_id in user_cache:
+            username, first_name = user_cache[user_id]
+        else:
+            user = await db.get_user(user_id)
+            username = user.get("username") if user else None
+            first_name = user.get("first_name") if user else None
+            user_cache[user_id] = (username, first_name)
+        display = texts.display_user(username, first_name)
+        status_label = _deposit_status_label(item["status"])
+        lines.append(
+            f"{status_label} | #{item['id']} | {display} | {format_money(item['amount'])} {config.currency}"
+        )
+
+    await state.clear()
+    await _send_blocks(message, lines, header=header, reply_markup=admin_menu())
 
 
 @router.callback_query(F.data == "admin:logs")
@@ -159,30 +335,39 @@ async def admin_users(callback: CallbackQuery, state: FSMContext, db: Database, 
         await callback.answer("Нет доступа", show_alert=True)
         return
     await state.clear()
-    users = await db.get_users_overview(limit=10)
+    users = await db.get_users_overview(limit=None)
     if not users:
         await callback.message.answer("Пока нет пользователей.", reply_markup=admin_menu())
         await callback.answer()
         return
+
+    game_rows = await db.get_user_game_stats()
+    user_games: dict[int, list[dict]] = {}
+    for row in game_rows:
+        user_games.setdefault(int(row["user_id"]), []).append(row)
 
     blocks: list[str] = []
     for user in users:
         name = texts.display_user(user.get("username"), user.get("first_name"))
         profit = float(user.get("payouts_sum", 0)) - float(user.get("bets_sum", 0))
         profit_sign = "+" if profit >= 0 else ""
-        blocks.append(
-            "\n".join(
-                [
-                    f"👤 <b>{name}</b>",
-                    f"💎 Баланс: <b>{format_money(user['balance'])} {config.currency}</b>",
-                    f"🎲 Ставки: <b>{format_money(user['bets_sum'])} {config.currency}</b> ({int(user['bets_count'])})",
-                    f"🏆 Профит: <b>{profit_sign}{format_money(profit)} {config.currency}</b>",
-                    f"💳 Пополнения: <b>{format_money(user['deposits_sum'])} {config.currency}</b>",
-                ]
-            )
-        )
+        lines = [
+            f"👤 <b>{name}</b>",
+            f"💎 Баланс: <b>{format_money(user['balance'])} {config.currency}</b>",
+            f"🎲 Ставки: <b>{format_money(user['bets_sum'])} {config.currency}</b> ({int(user['bets_count'])})",
+            f"🏆 Профит: <b>{profit_sign}{format_money(profit)} {config.currency}</b>",
+            f"💳 Пополнения: <b>{format_money(user['deposits_sum'])} {config.currency}</b>",
+        ]
 
-    await callback.message.answer("\n\n".join(blocks), reply_markup=admin_menu())
+        per_games = user_games.get(int(user["id"]), [])
+        for row in per_games:
+            game_profit = float(row["payouts_sum"]) - float(row["bets_sum"])
+            sign = "+" if game_profit >= 0 else ""
+            lines.append(f"{texts.game_title(row['game'])}: {sign}{format_money(game_profit)} {config.currency}")
+
+        blocks.append("\n".join(lines))
+
+    await _send_blocks(callback.message, blocks, reply_markup=admin_menu())
     await callback.answer()
 
 
