@@ -187,6 +187,7 @@ def admin_menu() -> InlineKeyboardMarkup:
     builder.button(text="💸 Выдать баланс", callback_data="admin:grant")
     builder.button(text="⛔ Стоп", callback_data="admin:maintenance")
     builder.button(text="💾 База данных", callback_data="admin:db")
+    builder.button(text="🔗 Подписка", callback_data="admin:subscribe")
     builder.button(text="⚙️ Настройки", callback_data="admin:settings")
     builder.button(text="🚫 Блокировки", callback_data="admin:bans")
     builder.button(text="⬅️ Назад", callback_data="menu:main")
@@ -217,5 +218,14 @@ def admin_freeze_action(withdraw_id: int) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="🔓 Разморозить", callback_data=f"freeze:unfreeze:{withdraw_id}")],
             [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"freeze:delete:{withdraw_id}")],
+        ]
+    )
+
+
+def subscribe_keyboard(url: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📣 Подписаться", url=url)],
+            [InlineKeyboardButton(text="✅ Проверить подписку", callback_data="subscribe:check")],
         ]
     )

@@ -24,3 +24,7 @@ class AdminGrantState(StatesGroup):
 
 class AdminFreezeState(StatesGroup):
     waiting_id = State()
+
+
+class AdminSubscribeState(StatesGroup):
+    waiting_link = State()

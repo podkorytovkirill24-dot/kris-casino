@@ -278,6 +278,12 @@ def maintenance_state(enabled: bool) -> str:
     return "✅ Казино снова работает. Игры открыты."
 
 
+def subscribe_required() -> str:
+    return (
+        "🔒 Для доступа к казино подпишись на группу и нажми «Проверить подписку»."
+    )
+
+
 def game_intro(game: str, currency: str) -> str:
     if game == "dice":
         return (
