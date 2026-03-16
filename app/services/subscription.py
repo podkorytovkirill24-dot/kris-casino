@@ -19,8 +19,11 @@ async def get_subscribe_target(db: Database) -> tuple[str | None, str | None]:
 
 
 async def is_subscribed(bot: Bot, chat_id: str, user_id: int) -> bool:
+    chat_ref: str | int = chat_id
+    if chat_id.lstrip("-").isdigit():
+        chat_ref = int(chat_id)
     try:
-        member = await bot.get_chat_member(chat_id, user_id)
+        member = await bot.get_chat_member(chat_ref, user_id)
     except Exception:
         return False
     status = getattr(member, "status", None)
