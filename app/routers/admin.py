@@ -18,6 +18,7 @@ from app.states import AdminGrantState, AdminFreezeState, AdminSubscribeState
 router = Router()
 
 _SUBSCRIBE_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,}$")
+_INVITE_LINK_RE = re.compile(r"(https?://)?t\.me/(joinchat/|\+)[A-Za-z0-9_-]+")
 
 
 def _admin_only_callback(callback: CallbackQuery, config: Config) -> bool:
@@ -32,7 +33,17 @@ def _owner_only(callback_or_message: CallbackQuery | Message, config: Config) ->
     return callback_or_message.from_user.id in config.owner_ids
 
 
-def _parse_subscribe_link(text: str) -> tuple[str, str] | None:
+def _extract_invite_link(text: str) -> str | None:
+    match = _INVITE_LINK_RE.search(text)
+    if not match:
+        return None
+    link = match.group(0)
+    if not link.startswith("http"):
+        link = "https://" + link
+    return link
+
+
+def _parse_public_chat(text: str) -> tuple[str, str] | None:
     value = text.strip()
     if not value:
         return None
@@ -42,7 +53,7 @@ def _parse_subscribe_link(text: str) -> tuple[str, str] | None:
     else:
         part = value
     part = part.lstrip("@")
-    if part.startswith("+"):
+    if part.startswith("+") or part.startswith("joinchat/"):
         return None
     if not _SUBSCRIBE_USERNAME_RE.match(part):
         return None
@@ -413,7 +424,13 @@ async def admin_subscribe(callback: CallbackQuery, state: FSMContext, db: Databa
     await callback.message.answer(
         "🔗 <b>Подписка на группу</b>\n"
         f"Текущая ссылка: {current}\n\n"
-        "Отправь новую публичную ссылку (например: https://t.me/username) или @username.\n"
+        "Публичная группа/канал:\n"
+        "- отправь ссылку https://t.me/username или @username.\n\n"
+        "Приватная группа:\n"
+        "- отправь ID группы и инвайт-ссылку через пробел,\n"
+        "  например: -1001234567890 https://t.me/+AbCdEf...\n"
+        "- или просто пересылай сюда любое сообщение из группы,\n"
+        "  бот сам возьмёт ID (ссылку можно добавить отдельно).\n\n"
         "Бот должен быть админом в этой группе/канале.\n"
         "Чтобы отключить проверку, отправь: off",
         reply_markup=back_to_admin(),
@@ -437,20 +454,67 @@ async def admin_subscribe_link(message: Message, state: FSMContext, db: Database
         await message.answer("✅ Проверка подписки отключена.", reply_markup=admin_menu())
         return
 
-    parsed = _parse_subscribe_link(text)
-    if not parsed:
-        await message.answer(
-            "⚠️ Нужна публичная ссылка вида https://t.me/username или @username.\n"
-            "Приватные инвайт-ссылки проверить нельзя.",
-            reply_markup=back_to_admin(),
-        )
+    # Forwarded message from group/channel: use its chat id
+    if message.forward_from_chat:
+        chat_id = str(message.forward_from_chat.id)
+        invite = _extract_invite_link(text) if text else None
+        await db.set_setting("subscribe_chat", chat_id)
+        if invite:
+            await db.set_setting("subscribe_url", invite)
+        await state.clear()
+        note = " (ссылка сохранена)" if invite else ""
+        await message.answer(f"✅ ID группы сохранен{note}.", reply_markup=admin_menu())
         return
 
-    chat_id, url = parsed
-    await db.set_setting("subscribe_chat", chat_id)
-    await db.set_setting("subscribe_url", url)
-    await state.clear()
-    await message.answer(f"✅ Ссылка сохранена: {url}", reply_markup=admin_menu())
+    tokens = text.split()
+    invite_link = _extract_invite_link(text)
+
+    # Numeric chat id for private groups
+    if tokens and tokens[0].lstrip("-").isdigit():
+        chat_id = tokens[0]
+        await db.set_setting("subscribe_chat", chat_id)
+        await db.set_setting("subscribe_url", invite_link or "")
+        await state.clear()
+        if invite_link:
+            await message.answer(f"✅ ID и ссылка сохранены: {invite_link}", reply_markup=admin_menu())
+        else:
+            await message.answer(
+                "✅ ID группы сохранен. Если нужна кнопка «Подписаться», отправь инвайт-ссылку.",
+                reply_markup=admin_menu(),
+            )
+        return
+
+    # Public username or link
+    parsed_public = _parse_public_chat(text)
+    if parsed_public:
+        chat_id, url = parsed_public
+        await db.set_setting("subscribe_chat", chat_id)
+        await db.set_setting("subscribe_url", url)
+        await state.clear()
+        await message.answer(f"✅ Ссылка сохранена: {url}", reply_markup=admin_menu())
+        return
+
+    # Invite link only (update url if chat_id already set)
+    if invite_link:
+        current_chat = (await db.get_setting("subscribe_chat", "") or "").strip()
+        if not current_chat:
+            await message.answer(
+                "⚠️ Сначала укажи ID группы (например: -1001234567890), затем инвайт-ссылку.",
+                reply_markup=back_to_admin(),
+            )
+            return
+        await db.set_setting("subscribe_url", invite_link)
+        await state.clear()
+        await message.answer(f"✅ Ссылка сохранена: {invite_link}", reply_markup=admin_menu())
+        return
+
+    await message.answer(
+        "⚠️ Не смог распознать данные.\n"
+        "Публично: https://t.me/username или @username\n"
+        "Приватно: -1001234567890 https://t.me/+AbCdEf...\n"
+        "Или просто перешли сообщение из группы.",
+        reply_markup=back_to_admin(),
+    )
 
 
 @router.callback_query(F.data == "admin:settings")
