@@ -1,5 +1,6 @@
 ﻿from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from aiogram import Router, F
@@ -12,9 +13,11 @@ from app.keyboards import admin_deposit_action, admin_menu, admin_withdraw_actio
 from app.services.access import is_admin
 from app import texts
 from app.utils import format_money, parse_amount
-from app.states import AdminGrantState, AdminFreezeState
+from app.states import AdminGrantState, AdminFreezeState, AdminSubscribeState
 
 router = Router()
+
+_SUBSCRIBE_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,}$")
 
 
 def _admin_only_callback(callback: CallbackQuery, config: Config) -> bool:
@@ -27,6 +30,25 @@ def _admin_only_message(message: Message, config: Config) -> bool:
 
 def _owner_only(callback_or_message: CallbackQuery | Message, config: Config) -> bool:
     return callback_or_message.from_user.id in config.owner_ids
+
+
+def _parse_subscribe_link(text: str) -> tuple[str, str] | None:
+    value = text.strip()
+    if not value:
+        return None
+    if "t.me/" in value:
+        part = value.split("t.me/", 1)[1]
+        part = part.split("?", 1)[0].strip("/")
+    else:
+        part = value
+    part = part.lstrip("@")
+    if part.startswith("+"):
+        return None
+    if not _SUBSCRIBE_USERNAME_RE.match(part):
+        return None
+    chat_id = f"@{part}"
+    url = f"https://t.me/{part}"
+    return chat_id, url
 
 
 @router.callback_query(F.data == "admin:stats")
@@ -377,6 +399,58 @@ async def admin_db_upload(message: Message, config: Config) -> None:
         return
 
     await message.answer("✅ База данных обновлена. Перезапусти бота.", reply_markup=admin_menu())
+
+
+@router.callback_query(F.data == "admin:subscribe")
+async def admin_subscribe(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+    if not _admin_only_callback(callback, config):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    await state.set_state(AdminSubscribeState.waiting_link)
+    current_url = (await db.get_setting("subscribe_url", "") or "").strip()
+    current_chat = (await db.get_setting("subscribe_chat", "") or "").strip()
+    current = current_url or current_chat or "не задано"
+    await callback.message.answer(
+        "🔗 <b>Подписка на группу</b>\n"
+        f"Текущая ссылка: {current}\n\n"
+        "Отправь новую публичную ссылку (например: https://t.me/username) или @username.\n"
+        "Бот должен быть админом в этой группе/канале.\n"
+        "Чтобы отключить проверку, отправь: off",
+        reply_markup=back_to_admin(),
+    )
+    await callback.answer()
+
+
+@router.message(AdminSubscribeState.waiting_link)
+async def admin_subscribe_link(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    if not _admin_only_message(message, config):
+        return
+    text = (message.text or "").strip()
+    if text.lower() in {"/cancel", "cancel", "отмена"}:
+        await state.clear()
+        await message.answer("Отменено.", reply_markup=admin_menu())
+        return
+    if text.lower() in {"off", "выкл", "disable", "0"}:
+        await db.set_setting("subscribe_chat", "")
+        await db.set_setting("subscribe_url", "")
+        await state.clear()
+        await message.answer("✅ Проверка подписки отключена.", reply_markup=admin_menu())
+        return
+
+    parsed = _parse_subscribe_link(text)
+    if not parsed:
+        await message.answer(
+            "⚠️ Нужна публичная ссылка вида https://t.me/username или @username.\n"
+            "Приватные инвайт-ссылки проверить нельзя.",
+            reply_markup=back_to_admin(),
+        )
+        return
+
+    chat_id, url = parsed
+    await db.set_setting("subscribe_chat", chat_id)
+    await db.set_setting("subscribe_url", url)
+    await state.clear()
+    await message.answer(f"✅ Ссылка сохранена: {url}", reply_markup=admin_menu())
 
 
 @router.callback_query(F.data == "admin:settings")

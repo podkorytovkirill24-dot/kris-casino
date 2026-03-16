@@ -10,6 +10,7 @@ from app.keyboards import deposit_amounts, deposit_pay_button, deposit_wait_butt
 from app.services.send_provider import build_invoice_id, build_comment, build_pay_url
 from app.services.crypto_pay import CryptoPayClient, CryptoPayError
 from app.services.access import is_admin
+from app.services.subscription import ensure_subscribed
 from app import texts
 from app.utils import format_money, parse_amount
 from app.states import DepositState
@@ -89,6 +90,8 @@ async def _create_deposit(amount: float, user_id: int, message: Message, db: Dat
 @router.callback_query(F.data == "menu:deposit")
 async def deposit_menu(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
     await state.clear()
+    if not await ensure_subscribed(callback, db):
+        return
     await db.upsert_user(callback.from_user.id, callback.from_user.username, callback.from_user.first_name)
     await callback.message.answer(
         texts.deposit_amount_prompt(config.min_deposit, config.currency),
@@ -98,7 +101,9 @@ async def deposit_menu(callback: CallbackQuery, state: FSMContext, db: Database,
 
 
 @router.callback_query(F.data == "deposit:custom")
-async def deposit_custom(callback: CallbackQuery, state: FSMContext, config: Config) -> None:
+async def deposit_custom(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+    if not await ensure_subscribed(callback, db):
+        return
     await state.set_state(DepositState.waiting_amount)
     await callback.message.answer(texts.deposit_custom_prompt(config.min_deposit, config.currency), reply_markup=back_to_deposit())
     await callback.answer()
@@ -106,6 +111,8 @@ async def deposit_custom(callback: CallbackQuery, state: FSMContext, config: Con
 
 @router.callback_query(F.data.startswith("deposit:"))
 async def deposit_create(callback: CallbackQuery, db: Database, config: Config) -> None:
+    if not await ensure_subscribed(callback, db):
+        return
     amount = float(callback.data.split(":", 1)[1])
     if amount < config.min_deposit:
         await callback.message.answer(texts.deposit_amount_prompt(config.min_deposit, config.currency))
@@ -117,6 +124,8 @@ async def deposit_create(callback: CallbackQuery, db: Database, config: Config) 
 
 @router.message(DepositState.waiting_amount)
 async def deposit_custom_amount(message: Message, state: FSMContext, db: Database, config: Config) -> None:
+    if not await ensure_subscribed(message, db):
+        return
     amount = parse_amount(message.text or "")
     if amount is None or amount < config.min_deposit:
         await message.answer(texts.invalid_deposit_amount(config.min_deposit, config.currency), reply_markup=back_to_deposit())

@@ -19,12 +19,14 @@ from app.keyboards import (
 )
 from app.states import GameState
 from app.utils import parse_amount
+from app.services.subscription import ensure_subscribed
 
 router = Router()
 
 
 async def _finalize_game(
     message: Message,
+    user_id: int,
     db: Database,
     config: Config,
     game: str,
@@ -34,10 +36,10 @@ async def _finalize_game(
     meta: dict,
     extra_lines: list[str],
 ) -> None:
-    await db.change_balance(message.from_user.id, -bet, "bet", {"game": game, "bet": bet})
+    await db.change_balance(user_id, -bet, "bet", {"game": game, "bet": bet})
     if win and payout > 0:
-        await db.change_balance(message.from_user.id, payout, "win", {"game": game, "payout": payout})
-    await db.add_bet(message.from_user.id, game, bet, payout if win else 0.0, win, meta)
+        await db.change_balance(user_id, payout, "win", {"game": game, "payout": payout})
+    await db.add_bet(user_id, game, bet, payout if win else 0.0, win, meta)
 
     header = texts.game_header(texts.game_title(game), bet, config.currency)
     result_line = texts.game_result(win, payout if win else 0.0, config.currency)
@@ -47,6 +49,7 @@ async def _finalize_game(
 
 async def _finalize_mines(
     message: Message,
+    user_id: int,
     db: Database,
     config: Config,
     bet: float,
@@ -56,8 +59,8 @@ async def _finalize_mines(
     extra_lines: list[str],
 ) -> None:
     if win and payout > 0:
-        await db.change_balance(message.from_user.id, payout, "win", {"game": "mines", "payout": payout})
-    await db.add_bet(message.from_user.id, "mines", bet, payout if win else 0.0, win, meta)
+        await db.change_balance(user_id, payout, "win", {"game": "mines", "payout": payout})
+    await db.add_bet(user_id, "mines", bet, payout if win else 0.0, win, meta)
 
     header = texts.game_header(texts.game_title("mines"), bet, config.currency)
     result_line = texts.game_result(win, payout if win else 0.0, config.currency)
@@ -67,6 +70,8 @@ async def _finalize_mines(
 
 @router.callback_query(F.data.startswith("game:"))
 async def game_selected(callback: CallbackQuery, state: FSMContext, db: Database, config: Config) -> None:
+    if not await ensure_subscribed(callback, db):
+        return
     game = callback.data.split(":", 1)[1]
     if await db.is_maintenance():
         await callback.message.answer(texts.maintenance_notice(), reply_markup=back_to_main())
@@ -112,6 +117,7 @@ async def bet_entered(message: Message, state: FSMContext, db: Database, config:
         extra = [texts.slots_result(result["reels"])]
         await _finalize_game(
             message,
+            message.from_user.id,
             db,
             config,
             game,
@@ -171,19 +177,52 @@ async def game_choice(callback: CallbackQuery, state: FSMContext, db: Database, 
         result = games.dice_roll(int(choice), config.win_rate)
         payout = bet * 5.5 if result["win"] else 0.0
         extra = [texts.dice_result(result["roll"])]
-        await _finalize_game(callback.message, db, config, game, bet, result["win"], payout, result, extra)
+        await _finalize_game(
+            callback.message,
+            callback.from_user.id,
+            db,
+            config,
+            game,
+            bet,
+            result["win"],
+            payout,
+            result,
+            extra,
+        )
 
     elif game == "coinflip":
         result = games.coinflip(choice, config.win_rate)
         payout = bet * 1.9 if result["win"] else 0.0
         extra = [texts.coinflip_result(result["result"])]
-        await _finalize_game(callback.message, db, config, game, bet, result["win"], payout, result, extra)
+        await _finalize_game(
+            callback.message,
+            callback.from_user.id,
+            db,
+            config,
+            game,
+            bet,
+            result["win"],
+            payout,
+            result,
+            extra,
+        )
 
     elif game == "roulette":
         result = games.roulette(choice, config.win_rate)
         payout = bet * 1.9 if result["win"] else 0.0
         extra = [texts.roulette_result(result["number"], result["color"])]
-        await _finalize_game(callback.message, db, config, game, bet, result["win"], payout, result, extra)
+        await _finalize_game(
+            callback.message,
+            callback.from_user.id,
+            db,
+            config,
+            game,
+            bet,
+            result["win"],
+            payout,
+            result,
+            extra,
+        )
 
     elif game == "crash":
         target = float(choice)
@@ -191,7 +230,18 @@ async def game_choice(callback: CallbackQuery, state: FSMContext, db: Database, 
         payout = bet * target if result["win"] else 0.0
         extra = [texts.crash_result(result["point"])]
         meta = {"target": target, "point": result["point"]}
-        await _finalize_game(callback.message, db, config, game, bet, result["win"], payout, meta, extra)
+        await _finalize_game(
+            callback.message,
+            callback.from_user.id,
+            db,
+            config,
+            game,
+            bet,
+            result["win"],
+            payout,
+            meta,
+            extra,
+        )
 
     await state.clear()
     await callback.answer()
@@ -254,6 +304,7 @@ async def mines_open(callback: CallbackQuery, state: FSMContext, db: Database, c
         )
         await _finalize_mines(
             callback.message,
+            callback.from_user.id,
             db,
             config,
             bet,
@@ -296,6 +347,7 @@ async def mines_cashout(callback: CallbackQuery, state: FSMContext, db: Database
     await state.clear()
     await _finalize_mines(
         callback.message,
+        callback.from_user.id,
         db,
         config,
         bet,
@@ -327,6 +379,7 @@ async def mines_forfeit(callback: CallbackQuery, state: FSMContext, db: Database
     )
     await _finalize_mines(
         callback.message,
+        callback.from_user.id,
         db,
         config,
         bet,
