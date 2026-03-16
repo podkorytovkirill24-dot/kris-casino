@@ -28,3 +28,7 @@ class AdminFreezeState(StatesGroup):
 
 class AdminSubscribeState(StatesGroup):
     waiting_link = State()
+
+
+class AdminDepositState(StatesGroup):
+    waiting_date = State()
